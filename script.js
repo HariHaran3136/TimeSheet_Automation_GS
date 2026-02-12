@@ -688,17 +688,34 @@ const UI = {
         const total = AppState.timesheetRows.reduce((sum, row) => sum + (parseFloat(row.hours) || 0), 0);
         document.getElementById('totalHours').textContent = total;
         
-        const maxAllowed = AppState.maxAllowedHours || 8;
+        const selectedDate = document.getElementById('entryDate').value;
         const submitBtn = document.querySelector('#timesheetForm button[type="submit"]');
+        const entryType = document.querySelector('.entry-type-btn.active, .entry-type-btn-small.active')?.dataset.type || 'work';
         
-        if (total > maxAllowed) {
-            AppState.canSubmit = false;
-            if (submitBtn) {
-                submitBtn.disabled = true;
-                submitBtn.style.opacity = '0.5';
-                submitBtn.style.cursor = 'not-allowed';
+        // Only enforce 8-hour validation for WORK entries
+        if (entryType === 'work' && selectedDate) {
+            // Get existing hours from server (work + leave)
+            const status = API.checkDateLeaveStatus(selectedDate);
+            const totalWithExisting = status.totalHours + total;
+            
+            // MUST be exactly 8 hours for work entries
+            if (totalWithExisting !== 8) {
+                AppState.canSubmit = false;
+                if (submitBtn) {
+                    submitBtn.disabled = true;
+                    submitBtn.style.opacity = '0.5';
+                    submitBtn.style.cursor = 'not-allowed';
+                }
+            } else {
+                AppState.canSubmit = true;
+                if (submitBtn) {
+                    submitBtn.disabled = false;
+                    submitBtn.style.opacity = '1';
+                    submitBtn.style.cursor = 'pointer';
+                }
             }
         } else {
+            // For leave entries, always allow submission
             AppState.canSubmit = true;
             if (submitBtn) {
                 submitBtn.disabled = false;
@@ -899,6 +916,8 @@ document.querySelectorAll('.entry-type-btn, .entry-type-btn-small').forEach(btn 
         btn.classList.add('active');
         // Toggle entry type
         UI.toggleEntryType(btn.dataset.type);
+        // Update total hours validation based on entry type
+        UI.updateTotalHours();
     });
 });
 
@@ -945,12 +964,14 @@ document.getElementById('timesheetForm').addEventListener('submit', async (e) =>
             }
             
             const totalHours = AppState.timesheetRows.reduce((sum, row) => sum + (parseFloat(row.hours) || 0), 0);
+            const totalWithExisting = status.totalHours + totalHours;
             
-            if (!AppState.canSubmit || totalHours > status.remainingHours) {
-                if (status.hasPartialLeave) {
-                    Utils.showToast(`Only ${status.remainingHours} hours are allowed for this date. You have ${status.leaveHours} hours leave already applied.`, 'error', 7000);
+            // MUST be exactly 8 hours
+            if (totalWithExisting !== 8) {
+                if (totalWithExisting > 8) {
+                    Utils.showToast(`Total hours exceed 8. You have ${status.totalHours} hours already logged. You can only add ${8 - status.totalHours} more hours.`, 'error', 7000);
                 } else {
-                    Utils.showToast(`Total hours exceed allowed limit. You have ${status.totalHours} hours already logged. Remaining: ${status.remainingHours} hours.`, 'error', 7000);
+                    Utils.showToast(`Total hours must be exactly 8. Current total: ${totalWithExisting} hours. You need ${8 - totalWithExisting} more hours.`, 'error', 7000);
                 }
                 Utils.setLoading(false);
                 return;
@@ -980,15 +1001,25 @@ document.getElementById('timesheetForm').addEventListener('submit', async (e) =>
                 return;
             }
             
-            // VALIDATION: Check for overlapping leave
+            // VALIDATION: Check if work already submitted for these dates
             const fromDate = new Date(leaveData.fromDate);
             const toDate = new Date(leaveData.toDate);
             
             for (let d = new Date(fromDate); d <= toDate; d.setDate(d.getDate() + 1)) {
                 const dateStr = d.toISOString().split('T')[0];
                 const status = API.checkDateLeaveStatus(dateStr);
+                
+                // Check if work hours already submitted
+                if (status.workHours > 0) {
+                    Utils.showToast(`Cannot apply leave. You have already submitted ${status.workHours} hours of work for ${dateStr}. Please contact admin to modify.`, 'error', 7000);
+                    Utils.setLoading(false);
+                    return;
+                }
+                
+                // Check for overlapping leave
                 if (status.hasFullLeave || status.hasPartialLeave) {
                     Utils.showToast('Leave already applied for overlapping dates. Please check your existing leave entries.', 'error', 7000);
+                    Utils.setLoading(false);
                     return;
                 }
             }
@@ -1091,6 +1122,20 @@ document.addEventListener('DOMContentLoaded', () => {
     if (leaveFromDate) leaveFromDate.max = today;
     if (leaveToDate) leaveToDate.max = today;
     
+    // Disable weekends in all date pickers
+    const disableWeekends = (e) => {
+        const date = new Date(e.target.value);
+        const day = date.getDay();
+        if (day === 0 || day === 6) {
+            e.target.value = '';
+            Utils.showToast('Weekends (Saturday and Sunday) are not allowed', 'error', 5000);
+        }
+    };
+    
+    if (entryDateInput) entryDateInput.addEventListener('change', disableWeekends);
+    if (leaveFromDate) leaveFromDate.addEventListener('change', disableWeekends);
+    if (leaveToDate) leaveToDate.addEventListener('change', disableWeekends);
+    
     // Load draft
     const draft = localStorage.getItem('timesheetDraft');
     if (draft) {
@@ -1114,17 +1159,29 @@ window.updateTimesheetRow = (idx, field, value) => {
 
 window.updateTimesheetHours = (idx, value) => {
     const newHours = parseFloat(value) || 0;
-    const maxAllowed = AppState.maxAllowedHours || 8;
+    const selectedDate = document.getElementById('entryDate').value;
     
-    const otherHours = AppState.timesheetRows.reduce((sum, row, i) => {
+    if (!selectedDate) {
+        AppState.timesheetRows[idx].hours = newHours;
+        UI.updateTotalHours();
+        return;
+    }
+    
+    // Get existing hours for this date (from server + leave)
+    const status = API.checkDateLeaveStatus(selectedDate);
+    
+    // Calculate current form hours (excluding the row being edited)
+    const currentFormHours = AppState.timesheetRows.reduce((sum, row, i) => {
         if (i !== idx) return sum + (parseFloat(row.hours) || 0);
         return sum;
     }, 0);
     
-    const totalHours = otherHours + newHours;
+    // Total = existing (work + leave) + current form hours + new hours
+    const totalHours = status.totalHours + currentFormHours + newHours;
     
-    if (totalHours > maxAllowed) {
-        Utils.showToast(`Only ${maxAllowed} hours are allowed for this date.`, 'error', 7000);
+    if (totalHours > 8) {
+        const remaining = 8 - status.totalHours - currentFormHours;
+        Utils.showToast(`Cannot exceed 8 hours. Already logged: ${status.totalHours} hrs. Current form: ${currentFormHours} hrs. Maximum allowed: ${remaining} hrs.`, 'error', 7000);
         AppState.timesheetRows[idx].hours = 0;
         document.querySelectorAll('#timesheetBody input[type="number"]')[idx].value = 0;
     } else {
